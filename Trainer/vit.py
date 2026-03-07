@@ -566,8 +566,6 @@ class MaskGIT(Trainer):
         labels=None,
         sm_temp=1,
         w=3,
-        randomize="linear",
-        r_temp=4.5,
     ):
         """Generate sample with the MaskGIT model using Gibbs sampling
         :param
@@ -576,8 +574,6 @@ class MaskGIT(Trainer):
          labels      -> torch.LongTensor: the list of classes to generate
          sm_temp     -> float:            the temperature before softmax
          w           -> float:            scale for the classifier free guidance
-         randomize   -> str:              linear|warm_up|random|no, either or not to add randomness
-         r_temp      -> float:            temperature for the randomness
         :return
          x          -> torch.FloatTensor: nb_sample x 3 x 256 x 256, the generated images
          code       -> torch.LongTensor:  nb_sample x step x 16 x 16, the code corresponding to the generated images
@@ -585,6 +581,7 @@ class MaskGIT(Trainer):
         self.vit.eval()
         l_codes = []  # Save the intermediate codes predicted
         l_mask = []  # Save the intermediate masks
+        total_tokens = self.patch_size * self.patch_size # Here, we sample one token at a time
 
         with torch.no_grad():
             if labels is None:  # Default classes generated
@@ -609,31 +606,41 @@ class MaskGIT(Trainer):
                 mask = (
                     (init_code == self.codebook_size)
                     .float()
-                    .view(nb_sample, self.patch_size * self.patch_size)
+                    .view(nb_sample, total_tokens)
                 )
             else:  # Initialize a code
                 # Code initialize with masked tokens
                 code = torch.full(
                     (nb_sample, self.patch_size, self.patch_size), self.args.mask_value
                 ).to(self.args.device)
-                mask = torch.ones(nb_sample, self.patch_size * self.patch_size).to(
+                mask = torch.ones(nb_sample, total_tokens).to(
                     self.args.device
                 )
 
             # Instantiate scheduler
-            sche = torch.ones(self.patch_size * self.patch_size, dtype=torch.int)
+            sche = torch.ones(total_tokens, dtype=torch.int)
             scheduler = tqdm(sche, leave=False)
 
-            scheduler = torch.randperm(self.patch_size * self.patch_size).to(
+            scheduler = torch.randperm(total_tokens).to(
                 self.args.device
             )
 
             # Beginning of sampling, t = number of token to predict a step "indice"
+            save_steps = [
+                0, 1, 2, 3,
+                total_tokens // 2 - 1,
+                total_tokens // 2,
+                total_tokens // 2 + 1,
+                total_tokens - 4,
+                total_tokens - 3,
+                total_tokens - 2,
+                total_tokens - 1,
+            ] # We only save a few steps for display
             for t, pos in enumerate(scheduler):
                 if mask.sum() == 0:  # Break if code is fully predicted
                     break
 
-                cfg_start_step = self.patch_size * self.patch_size - 11
+                cfg_start_step = total_tokens - 11 # We only uste it at the end of the algorithm
                 with torch.cuda.amp.autocast():  # half precision
                     if w != 0 and t > cfg_start_step:
                         # Model Prediction
@@ -661,14 +668,146 @@ class MaskGIT(Trainer):
                 code_flat = code.view(nb_sample, -1)
                 code_flat[:, pos] = pred
 
+                # update the mask
                 mask[:, pos] = 0
+
+                if t in save_steps:
+                    l_codes.append(code.detach().cpu().clone())
+                    l_mask.append(
+                        mask.view(nb_sample, self.patch_size, self.patch_size)
+                        .detach()
+                        .cpu()
+                        .clone()
+                    )
+
+            # decode the final prediction
+            _code = torch.clamp(code, 0, self.codebook_size - 1)
+            x = self.ae.decode_code(_code)
+
+        self.vit.train()
+        return x, l_codes, l_mask
+
+
+    def sample_metropolis_hastings(
+        self,
+        init_code=None,
+        nb_sample=50,
+        labels=None,
+        sm_temp=1,
+        w=3,
+    ):
+        """Generate sample with the MaskGIT model using Gibbs sampling
+        :param
+        init_code   -> torch.LongTensor: nb_sample x 16 x 16, the starting initialization code
+        nb_sample   -> int:              the number of image to generated
+        labels      -> torch.LongTensor: the list of classes to generate
+        sm_temp     -> float:            the temperature before softmax
+        w           -> float:            scale for the classifier free guidance
+        :return
+        x          -> torch.FloatTensor: nb_sample x 3 x 256 x 256, the generated images
+        code       -> torch.LongTensor:  nb_sample x step x 16 x 16, the code corresponding to the generated images
+        """
+        self.vit.eval()
+        l_codes = []  # Save the intermediate codes predicted
+        l_mask = []  # Save the intermediate masks
+        total_tokens = self.patch_size * self.patch_size # Here, we sample one token at a time
+
+        with torch.no_grad():
+            if labels is None:  # Default classes generated
+                # goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear, random
+                labels = [
+                    1,
+                    7,
+                    282,
+                    604,
+                    724,
+                    179,
+                    751,
+                    404,
+                    850,
+                    random.randint(0, 999),
+                ] * (nb_sample // 10)
+                labels = torch.LongTensor(labels).to(self.args.device)
+
+            drop = torch.ones(nb_sample, dtype=torch.bool).to(self.args.device)
+            if init_code is not None:  # Start with a pre-define code
+                code = init_code
+                mask = (
+                    (init_code == self.codebook_size)
+                    .float()
+                    .view(nb_sample, total_tokens)
+                )
+            else:  # Initialize a code
+                # Code initialize with masked tokens
+                code = torch.full(
+                    (nb_sample, self.patch_size, self.patch_size), self.args.mask_value
+                ).to(self.args.device)
+                mask = torch.ones(nb_sample, total_tokens).to(
+                    self.args.device
+                )
+
+            # Instantiate scheduler
+            sche = torch.ones(total_tokens, dtype=torch.int)
+            scheduler = tqdm(sche, leave=False)
+
+            scheduler = torch.randperm(total_tokens).to(
+                self.args.device
+            )
+
+            # Beginning of sampling, t = number of token to predict a step "indice"
+            save_steps = [
+                0, 1, 2, 3,
+                total_tokens // 2 - 1,
+                total_tokens // 2,
+                total_tokens // 2 + 1,
+                total_tokens - 4,
+                total_tokens - 3,
+                total_tokens - 2,
+                total_tokens - 1,
+            ] # We only save a few steps for display
+            for t, pos in enumerate(scheduler):
+                if mask.sum() == 0:  # Break if code is fully predicted
+                    break
+
+                cfg_start_step = total_tokens - 11 # We only uste it at the end of the algorithm
+                with torch.cuda.amp.autocast():  # half precision
+                    if w != 0 and t > cfg_start_step:
+                        # Model Prediction
+                        logit = self.vit(
+                            torch.cat([code, code], dim=0),
+                            torch.cat([labels, labels], dim=0),
+                            torch.cat([~drop, drop], dim=0),
+                        )
+                        logit_c, logit_u = torch.chunk(logit, 2, dim=0)
+                        _w = w * (t / (len(scheduler) - 1))
+                        # Classifier Free Guidance
+                        logit = (1 + _w) * logit_c - _w * logit_u
+                    else:
+                        logit = self.vit(code, labels, drop_label=~drop)
+
+                current_logit = logit[
+                    :, pos, :
+                ]  # we only take the logits of the right position
+                prob = torch.softmax(current_logit * sm_temp, -1)
+
+                # Sample the code from the softmax prediction
+                distri = torch.distributions.Categorical(probs=prob)
+                pred = distri.sample()
+
+                code_flat = code.view(nb_sample, -1)
+                code_flat[:, pos] = pred
 
                 # update the mask
                 mask[:, pos] = 0
-                l_codes.append(code.clone())
-                l_mask.append(
-                    mask.view(nb_sample, self.patch_size, self.patch_size).clone()
-                )
+
+                if t in save_steps:
+                    l_codes.append(code.detach().cpu().clone())
+                    l_mask.append(
+                        mask.view(nb_sample, self.patch_size, self.patch_size)
+                        .detach()
+                        .cpu()
+                        .clone()
+                    )
 
             # decode the final prediction
             _code = torch.clamp(code, 0, self.codebook_size - 1)
