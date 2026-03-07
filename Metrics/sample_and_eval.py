@@ -16,7 +16,7 @@ def remap_image_torch(image):
 
 
 class SampleAndEval:
-    def __init__(self, device, num_images=50000, compute_per_class_metrics=False, num_classes=1000):
+    def __init__(self, device, sample_method="adhoc", num_images=50000, compute_per_class_metrics=False, num_classes=1000):
         super().__init__()
         self.inception_metrics = MultiInceptionMetrics(
             reset_real_features=False,
@@ -30,6 +30,7 @@ class SampleAndEval:
         self.num_images = num_images
         self.true_features_computed = False
         self.device = device
+        self.sample_method = sample_method
 
     def compute_and_log_metrics(self, module):
         with torch.no_grad():
@@ -73,14 +74,25 @@ class SampleAndEval:
                     labels = module.clip.encode_text(labels).float()
                 else:
                     labels = labels.to(self.device)
-                images = module.sample(nb_sample=images.size(0),
-                                       labels=labels,
-                                       sm_temp=module.args.sm_temp,
-                                       w=module.args.cfg_w,
-                                       randomize="linear",
-                                       r_temp=module.args.r_temp,
-                                       sched_mode=module.args.sched_mode,
-                                       step=module.args.step)[0]
+                if self.sample_method == "adhoc":
+                    images = module.sample(nb_sample=images.size(0),
+                                          labels=labels,
+                                          sm_temp=module.args.sm_temp,
+                                          w=module.args.cfg_w,
+                                          randomize="linear",
+                                          r_temp=module.args.r_temp,
+                                          sched_mode=module.args.sched_mode,
+                                          step=module.args.step)[0]
+                elif self.sample_method == "gibbs":
+                    images = module.sample_gibbs(nb_sample=images.size(0),
+                                          labels=labels,
+                                          sm_temp=module.args.sm_temp,
+                                          w=module.args.cfg_w)[0]
+                elif self.sample_method == "metropolis-hastings":
+                    images = module.sample_metropolis_hastings(nb_sample=images.size(0),
+                                          labels=labels,
+                                          sm_temp=module.args.sm_temp,
+                                          w=module.args.cfg_w)[0]
                 images = images.float()
                 self.inception_metrics.update(remap_image_torch(images),
                                               labels,
