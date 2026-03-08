@@ -32,16 +32,18 @@ class SampleAndEval:
         self.device = device
         self.sample_method = sample_method
 
-    def compute_and_log_metrics(self, module):
+    def compute_and_log_metrics(self, module, fid_only=False):
         with torch.no_grad():
             if not self.true_features_computed or not self.inception_metrics.reset_real_features:
                 self.compute_true_images_features(module.test_data)
                 self.true_features_computed = True
             self.compute_fake_images_features(module, module.test_data)
 
-            metrics = self.inception_metrics.compute()
+            metrics = self.inception_metrics.compute(fid_only = True)
             metrics = {f"Eval/{k}": v for k, v in metrics.items()}
+            
             print(metrics)
+            return metrics
 
     def compute_true_images_features(self, dataloader):
         if len(dataloader.dataset) < self.num_images:
