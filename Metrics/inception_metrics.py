@@ -53,7 +53,7 @@ class MatrixSquareRoot(Function):
     def forward(ctx: Any, input_data: Tensor) -> Tensor:
         # TODO: update whenever pytorch gets an matrix square root function
         # Issue: https://github.com/pytorch/pytorch/issues/9983
-        m = input_data.detach().cpu().numpy().astype(np.float_)
+        m = input_data.detach().cpu().numpy().astype(np.float64)
         scipy_res, _ = scipy.linalg.sqrtm(m, disp=False)
         sqrtm = torch.from_numpy(scipy_res.real).to(input_data)
         ctx.save_for_backward(sqrtm)
@@ -372,7 +372,7 @@ class MultiInceptionMetrics(Metric):
             torch.stack(coverage).mean().item(),
         )
 
-    def compute(self) -> Tensor:
+    def compute(self, fid_only = False) -> Tensor:
         output_metrics = {}
         real_features = torch.cat(self.real_features, dim=0)
         if self.compute_unconditional_metrics:
@@ -381,31 +381,33 @@ class MultiInceptionMetrics(Metric):
             output_metrics["fid_unconditional"] = self.fid(
                 real_features, fake_uncond_features
             )
-            output_metrics["inception_score_unconditional"] = self.inception_score(
-                fake_uncond_logits
-            )
-            (
-                output_metrics["precision_unconditional"],
-                output_metrics["recall_unconditional"],
-                output_metrics["density_unconditional"],
-                output_metrics["coverage_unconditional"],
-            ) = self.manifold_metrics(
-                real_features, fake_uncond_features, self.manifold_k
-            )
+            if not fid_only:
+                output_metrics["inception_score_unconditional"] = self.inception_score(
+                    fake_uncond_logits
+                )
+                (
+                    output_metrics["precision_unconditional"],
+                    output_metrics["recall_unconditional"],
+                    output_metrics["density_unconditional"],
+                    output_metrics["coverage_unconditional"],
+                ) = self.manifold_metrics(
+                    real_features, fake_uncond_features, self.manifold_k
+                )
 
         if self.compute_conditional_metrics:
             fake_cond_features = torch.cat(self.fake_cond_features, dim=0).to("cuda")
             fake_cond_logits = torch.cat(self.fake_cond_logits, dim=0).to("cuda")
             output_metrics["fid_conditional"] = self.fid(real_features, fake_cond_features)
-            output_metrics["inception_score_conditional"] = self.inception_score(fake_cond_logits)
-            (
-                output_metrics["precision_conditional"],
-                output_metrics["recall_conditional"],
-                output_metrics["density_conditional"],
-                output_metrics["coverage_conditional"],
-            ) = self.manifold_metrics(
-                real_features, fake_cond_features, self.manifold_k
-            )
+            if not fid_only:
+                output_metrics["inception_score_conditional"] = self.inception_score(fake_cond_logits)
+                (
+                    output_metrics["precision_conditional"],
+                    output_metrics["recall_conditional"],
+                    output_metrics["density_conditional"],
+                    output_metrics["coverage_conditional"],
+                ) = self.manifold_metrics(
+                    real_features, fake_cond_features, self.manifold_k
+                )
 
         if self.compute_conditional_metrics_per_class:
             fid_per_class = 0
