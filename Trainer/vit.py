@@ -694,11 +694,11 @@ class MaskGIT(Trainer):
     nb_sample=50,
     labels=None,
     sm_temp=1.0,
-    w=3.0,
+    w=0.0,
     steps=200,
     jump_size=4,
 ):
-        """Generate sample with the MaskGIT model using Gibbs sampling
+        """Generate sample with the MaskGIT model using Metropolis-Hastings
         :param
          init_code   -> torch.LongTensor: nb_sample x 16 x 16, the starting initialization code
          nb_sample   -> int:              the number of image to generated
@@ -773,68 +773,59 @@ class MaskGIT(Trainer):
                 ).indices
 
                 # forward proposal q(x'|x)
-                prop_flat = code_flat.clone()
-                for b in range(nb_sample): # Nouvelle image avec ces positions masquées
-                    prop_flat[b, idx[b]] = self.args.mask_value
-                prop_code = prop_flat.view(nb_sample, self.patch_size, self.patch_size)
+                masked_block = code_flat.clone()
+                for b in range(nb_sample):
+                    masked_block[b, idx[b]] = self.args.mask_value
+                masked_block = masked_block.view(nb_sample, self.patch_size, self.patch_size)
 
                 with torch.cuda.amp.autocast():
                     if w != 0:
                         logits = self.vit(
-                            torch.cat([prop_code, prop_code], dim=0),
+                            torch.cat([masked_block, masked_block], dim=0),
                             torch.cat([labels, labels], dim=0),
                             torch.cat([~drop, drop], dim=0),
                         )
                         logits_c, logits_u = torch.chunk(logits, 2, dim=0)
                         logits = (1 + w) * logits_c - w * logits_u
                     else:
-                        logits = self.vit(prop_code, labels, drop_label=~drop)
+                        logits = self.vit(masked_block, labels, drop_label=~drop)
 
                 logp = F.log_softmax(logits * sm_temp, dim=-1)
 
-                cand_flat = code_flat.clone() # On crée les samples associés
+                cand_flat = code_flat.clone()
                 log_q_fwd = torch.zeros(nb_sample, device=self.args.device)
+                log_q_rev = torch.zeros(nb_sample, device=self.args.device)
 
                 for b in range(nb_sample):
-                    pos = idx[b] #on prends un batch
-                    dist = torch.distributions.Categorical(logits=logits[b, pos, :] * sm_temp) #logits des positions
-                    new_tok = dist.sample() #on choisit dans cette distrivutuion
-                    cand_flat[b, pos] = new_tok #on remplace les tokens choisis
-                    log_q_fwd[b] = logp[b, pos, new_tok].sum() #log proba de tous les tokens qu'on vient de sampler
+                    pos = idx[b]
+
+                    dist = torch.distributions.Categorical(logits=logits[b, pos, :] * sm_temp)
+                    new_tok = dist.sample()
+
+                    old_tok = code_flat[b, pos]
+
+                    cand_flat[b, pos] = new_tok
+
+                    log_q_fwd[b] = logp[b, pos, new_tok].sum()
+                    log_q_rev[b] = logp[b, pos, old_tok].sum()
 
                 cand = cand_flat.view(nb_sample, self.patch_size, self.patch_size)
 
-                # reverse proposal q(x|x')
-                rev_flat = cand_flat.clone()
-                for b in range(nb_sample):
-                    rev_flat[b, idx[b]] = self.args.mask_value #on masque les postions qu'on a choisi de masquer
-                rev_code = rev_flat.view(nb_sample, self.patch_size, self.patch_size)
-
-                with torch.cuda.amp.autocast():
-                    if w != 0:
-                        rev_logits = self.vit(
-                            torch.cat([rev_code, rev_code], dim=0),
-                            torch.cat([labels, labels], dim=0),
-                            torch.cat([~drop, drop], dim=0),
-                        )
-                        rev_logits_c, rev_logits_u = torch.chunk(rev_logits, 2, dim=0)
-                        rev_logits = (1 + w) * rev_logits_c - w * rev_logits_u
-                    else:
-                        rev_logits = self.vit(rev_code, labels, drop_label=~drop)
-
-                rev_logp = F.log_softmax(rev_logits * sm_temp, dim=-1)
-
-                log_q_rev = torch.zeros(nb_sample, device=self.args.device)
-                for b in range(nb_sample): #on met à jour les log reverses
-                    pos = idx[b]
-                    old_tok = code_flat[b, pos]
-                    log_q_rev[b] = rev_logp[b, pos, old_tok].sum()
-
-                # # MH accept
-                changed_positions = torch.unique(idx.flatten())
                 # on attribue les énergies
-                E_old = self.energy_raw(code, labels, positions=changed_positions, sm_temp=sm_temp, w=0.0)
-                E_new = self.energy_raw(cand, labels, positions=changed_positions, sm_temp=sm_temp, w=0.0)
+                E_old = torch.zeros(nb_sample, device=self.args.device)
+                E_new = torch.zeros(nb_sample, device=self.args.device)
+
+                for b in range(nb_sample):
+                    E_old[b] = self.energy_norm(
+                        code[b:b+1],
+                        labels[b:b+1],
+                        positions=idx[b],
+                    )[0]
+                    E_new[b] = self.energy_norm(
+                        cand[b:b+1],
+                        labels[b:b+1],
+                        positions=idx[b],
+                    )[0]
 
                 log_alpha = -(E_new - E_old) + (log_q_rev - log_q_fwd)
                 accept = torch.rand(nb_sample, device=self.args.device) < torch.exp(
@@ -862,7 +853,7 @@ class MaskGIT(Trainer):
         self.vit.train()
         return x, l_codes, l_mask
 
-    def energy_raw(self, code, labels, positions=None, sm_temp=1.0, w=0.0):
+    def energy_norm(self, code, labels, positions=None):
         device = code.device
         #batch size et longeur de la séquence
         B = code.size(0)
@@ -883,18 +874,9 @@ class MaskGIT(Trainer):
 
             #on calcule les logits des tokens
             with torch.cuda.amp.autocast():
-                if w != 0:
-                    logits = self.vit(
-                        torch.cat([masked, masked], dim=0),
-                        torch.cat([labels, labels], dim=0),
-                        torch.cat([~drop, drop], dim=0),
-                    )
-                    logits_c, logits_u = torch.chunk(logits, 2, dim=0)
-                    logits = (1 + w) * logits_c - w * logits_u
-                else:
                     logits = self.vit(masked, labels, drop_label=~drop)
             #on obtient les log probas
-            logp = F.log_softmax(logits[:, i, :] * sm_temp, dim=-1)
+            logp = F.log_softmax(logits[:, i, :], dim=-1)
             #on prend le ie token
             tok = flat_code[:, i]
             # on let à jour l'énergie
