@@ -689,129 +689,215 @@ class MaskGIT(Trainer):
 
 
     def sample_metropolis_hastings(
-        self,
-        init_code=None,
-        nb_sample=50,
-        labels=None,
-        sm_temp=1,
-        w=3,
-    ):
+    self,
+    init_code=None,
+    nb_sample=50,
+    labels=None,
+    sm_temp=1.0,
+    w=3.0,
+    steps=200,
+    jump_size=4,
+):
         """Generate sample with the MaskGIT model using Gibbs sampling
         :param
-        init_code   -> torch.LongTensor: nb_sample x 16 x 16, the starting initialization code
-        nb_sample   -> int:              the number of image to generated
-        labels      -> torch.LongTensor: the list of classes to generate
-        sm_temp     -> float:            the temperature before softmax
-        w           -> float:            scale for the classifier free guidance
+         init_code   -> torch.LongTensor: nb_sample x 16 x 16, the starting initialization code
+         nb_sample   -> int:              the number of image to generated
+         labels      -> torch.LongTensor: the list of classes to generate
+         sm_temp     -> float:            the temperature before softmax
+         w           -> float:            scale for the classifier free guidance
         :return
-        x          -> torch.FloatTensor: nb_sample x 3 x 256 x 256, the generated images
-        code       -> torch.LongTensor:  nb_sample x step x 16 x 16, the code corresponding to the generated images
+         x          -> torch.FloatTensor: nb_sample x 3 x 256 x 256, the generated images
+         code       -> torch.LongTensor:  nb_sample x step x 16 x 16, the code corresponding to the generated images
         """
         self.vit.eval()
-        l_codes = []  # Save the intermediate codes predicted
-        l_mask = []  # Save the intermediate masks
+        l_codes = [] # Save the intermediate codes predicted
+        l_mask = [] # Save the intermediate masks
         total_tokens = self.patch_size * self.patch_size # Here, we sample one token at a time
 
         with torch.no_grad():
-            if labels is None:  # Default classes generated
+            if labels is None: # Default classes generated
                 # goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear, random
-                labels = [
-                    1,
-                    7,
-                    282,
-                    604,
-                    724,
-                    179,
-                    751,
-                    404,
-                    850,
-                    random.randint(0, 999),
-                ] * (nb_sample // 10)
+                base_labels = [1, 7, 282, 604, 724, 179, 751, 404, 850, random.randint(0, 999)]
+                labels = (base_labels * math.ceil(nb_sample / 10))[:nb_sample]
                 labels = torch.LongTensor(labels).to(self.args.device)
+            else:
+                labels = labels.to(self.args.device)
 
-            drop = torch.ones(nb_sample, dtype=torch.bool).to(self.args.device)
-            if init_code is not None:  # Start with a pre-define code
-                code = init_code
-                mask = (
-                    (init_code == self.codebook_size)
-                    .float()
-                    .view(nb_sample, total_tokens)
-                )
-            else:  # Initialize a code
+            drop = torch.ones(nb_sample, dtype=torch.bool, device=self.args.device)
+
+            if init_code is not None: # Start with a pre-define code
+                code = init_code.to(self.args.device).clone()
+            else: # Initialize a code
                 # Code initialize with masked tokens
                 code = torch.full(
-                    (nb_sample, self.patch_size, self.patch_size), self.args.mask_value
-                ).to(self.args.device)
-                mask = torch.ones(nb_sample, total_tokens).to(
-                    self.args.device
+                    (nb_sample, self.patch_size, self.patch_size),
+                    self.args.mask_value,
+                    device=self.args.device,
+                    dtype=torch.long,
                 )
 
-            # Instantiate scheduler
-            sche = torch.ones(total_tokens, dtype=torch.int)
-            scheduler = tqdm(sche, leave=False)
-
-            scheduler = torch.randperm(total_tokens).to(
-                self.args.device
-            )
-
-            # Beginning of sampling, t = number of token to predict a step "indice"
-            save_steps = [
-                0, 1, 2, 3,
-                total_tokens // 2 - 1,
-                total_tokens // 2,
-                total_tokens // 2 + 1,
-                total_tokens - 4,
-                total_tokens - 3,
-                total_tokens - 2,
-                total_tokens - 1,
-            ] # We only save a few steps for display
-            for t, pos in enumerate(scheduler):
-                if mask.sum() == 0:  # Break if code is fully predicted
-                    break
-
-                cfg_start_step = total_tokens - 11 # We only uste it at the end of the algorithm
-                with torch.cuda.amp.autocast():  # half precision
-                    if w != 0 and t > cfg_start_step:
-                        # Model Prediction
-                        logit = self.vit(
+                # warm start
+                with torch.cuda.amp.autocast():
+                    if w != 0:
+                        logits = self.vit(
                             torch.cat([code, code], dim=0),
                             torch.cat([labels, labels], dim=0),
                             torch.cat([~drop, drop], dim=0),
                         )
-                        logit_c, logit_u = torch.chunk(logit, 2, dim=0)
-                        _w = w * (t / (len(scheduler) - 1))
-                        # Classifier Free Guidance
-                        logit = (1 + _w) * logit_c - _w * logit_u
+                        logits_c, logits_u = torch.chunk(logits, 2, dim=0)
+                        logits = (1 + w) * logits_c - w * logits_u
                     else:
-                        logit = self.vit(code, labels, drop_label=~drop)
+                        logits = self.vit(code, labels, drop_label=~drop)
 
-                current_logit = logit[
-                    :, pos, :
-                ]  # we only take the logits of the right position
-                prob = torch.softmax(current_logit * sm_temp, -1)
+                pred = torch.distributions.Categorical(logits=logits * sm_temp).sample()
+                code = pred.view(nb_sample, self.patch_size, self.patch_size)
 
-                # Sample the code from the softmax prediction
-                distri = torch.distributions.Categorical(probs=prob)
-                pred = distri.sample()
+            # Beginning of sampling, t = number of token to predict a step "indice"
+            save_steps = [
+                0, 1, 2, 3,
+                max(0, steps // 2 - 1),
+                steps // 2,
+                min(steps - 1, steps // 2 + 1),
+                max(0, steps - 4),
+                max(0, steps - 3),
+                max(0, steps - 2),
+                max(0, steps - 1),
+            ]
 
-                code_flat = code.view(nb_sample, -1)
-                code_flat[:, pos] = pred
+            for s in range(steps):
+                code_flat = code.view(nb_sample, total_tokens)
 
-                # update the mask
-                mask[:, pos] = 0
+                # positions aléatoires à modifier
+                idx = torch.rand((nb_sample, total_tokens), device=self.args.device).topk(
+                    min(jump_size, total_tokens), dim=1
+                ).indices
 
-                if t in save_steps:
+                # forward proposal q(x'|x)
+                prop_flat = code_flat.clone()
+                for b in range(nb_sample): # Nouvelle image avec ces positions masquées
+                    prop_flat[b, idx[b]] = self.args.mask_value
+                prop_code = prop_flat.view(nb_sample, self.patch_size, self.patch_size)
+
+                with torch.cuda.amp.autocast():
+                    if w != 0:
+                        logits = self.vit(
+                            torch.cat([prop_code, prop_code], dim=0),
+                            torch.cat([labels, labels], dim=0),
+                            torch.cat([~drop, drop], dim=0),
+                        )
+                        logits_c, logits_u = torch.chunk(logits, 2, dim=0)
+                        logits = (1 + w) * logits_c - w * logits_u
+                    else:
+                        logits = self.vit(prop_code, labels, drop_label=~drop)
+
+                logp = F.log_softmax(logits * sm_temp, dim=-1)
+
+                cand_flat = code_flat.clone() # On crée les samples associés
+                log_q_fwd = torch.zeros(nb_sample, device=self.args.device)
+
+                for b in range(nb_sample):
+                    pos = idx[b] #on prends un batch
+                    dist = torch.distributions.Categorical(logits=logits[b, pos, :] * sm_temp) #logits des positions
+                    new_tok = dist.sample() #on choisit dans cette distrivutuion
+                    cand_flat[b, pos] = new_tok #on remplace les tokens choisis
+                    log_q_fwd[b] = logp[b, pos, new_tok].sum() #log proba de tous les tokens qu'on vient de sampler
+
+                cand = cand_flat.view(nb_sample, self.patch_size, self.patch_size)
+
+                # reverse proposal q(x|x')
+                rev_flat = cand_flat.clone()
+                for b in range(nb_sample):
+                    rev_flat[b, idx[b]] = self.args.mask_value #on masque les postions qu'on a choisi de masquer
+                rev_code = rev_flat.view(nb_sample, self.patch_size, self.patch_size)
+
+                with torch.cuda.amp.autocast():
+                    if w != 0:
+                        rev_logits = self.vit(
+                            torch.cat([rev_code, rev_code], dim=0),
+                            torch.cat([labels, labels], dim=0),
+                            torch.cat([~drop, drop], dim=0),
+                        )
+                        rev_logits_c, rev_logits_u = torch.chunk(rev_logits, 2, dim=0)
+                        rev_logits = (1 + w) * rev_logits_c - w * rev_logits_u
+                    else:
+                        rev_logits = self.vit(rev_code, labels, drop_label=~drop)
+
+                rev_logp = F.log_softmax(rev_logits * sm_temp, dim=-1)
+
+                log_q_rev = torch.zeros(nb_sample, device=self.args.device)
+                for b in range(nb_sample): #on met à jour les log reverses
+                    pos = idx[b]
+                    old_tok = code_flat[b, pos]
+                    log_q_rev[b] = rev_logp[b, pos, old_tok].sum()
+
+                # # MH accept
+                changed_positions = torch.unique(idx.flatten())
+                # on attribue les énergies
+                E_old = self.energy_raw(code, labels, positions=changed_positions, sm_temp=sm_temp, w=0.0)
+                E_new = self.energy_raw(cand, labels, positions=changed_positions, sm_temp=sm_temp, w=0.0)
+
+                log_alpha = -(E_new - E_old) + (log_q_rev - log_q_fwd)
+                accept = torch.rand(nb_sample, device=self.args.device) < torch.exp(
+                    torch.clamp(log_alpha, max=0.0)
+                )
+
+                code_flat[accept] = cand_flat[accept]
+                code = code_flat.view(nb_sample, self.patch_size, self.patch_size)
+
+                if s in save_steps:
                     l_codes.append(code.detach().cpu().clone())
+
+                    current_mask = torch.ones(nb_sample, total_tokens, device=self.args.device)
+                    for b in range(nb_sample):
+                        current_mask[b, idx[b]] = 0
                     l_mask.append(
-                        mask.view(nb_sample, self.patch_size, self.patch_size)
+                        current_mask.view(nb_sample, self.patch_size, self.patch_size)
                         .detach()
                         .cpu()
                         .clone()
                     )
 
-            # decode the final prediction
-            _code = torch.clamp(code, 0, self.codebook_size - 1)
-            x = self.ae.decode_code(_code)
+            x = self.ae.decode_code(torch.clamp(code, 0, self.codebook_size - 1))
 
         self.vit.train()
         return x, l_codes, l_mask
+
+def energy_raw(self, code, labels, positions=None, sm_temp=1.0, w=0.0):
+    device = code.device
+    #batch size et longeur de la séquence
+    B = code.size(0)
+    T = self.patch_size * self.patch_size
+
+    flat_code = code.view(B, T)
+
+    if positions is None:
+        positions = torch.arange(T, device=device) #on prend les log probas de tous les tokens
+
+    drop = torch.ones(B, dtype=torch.bool, device=device)
+    E = torch.zeros(B, device=device) #on initialise notre énergie
+
+    for i in positions.tolist(): #on va calculer les log proba de tous les tokens dans positions
+        masked = flat_code.clone() #on copie l'image
+        masked[:, i] = self.args.mask_value #on masque les tokens à la position i dans tous les batchs
+        masked = masked.view(B, self.patch_size, self.patch_size)
+
+        #on calcule les logits des tokens
+        with torch.cuda.amp.autocast():
+            if w != 0:
+                logits = self.vit(
+                    torch.cat([masked, masked], dim=0),
+                    torch.cat([labels, labels], dim=0),
+                    torch.cat([~drop, drop], dim=0),
+                )
+                logits_c, logits_u = torch.chunk(logits, 2, dim=0)
+                logits = (1 + w) * logits_c - w * logits_u
+            else:
+                logits = self.vit(masked, labels, drop_label=~drop)
+        #on obtient les log probas
+        logp = F.log_softmax(logits[:, i, :] * sm_temp, dim=-1)
+        #on prend le ie token
+        tok = flat_code[:, i]
+        # on let à jour l'énergie
+        E -= logp.gather(1, tok[:, None]).squeeze(1)
+
+    return E
