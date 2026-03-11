@@ -819,12 +819,10 @@ class MaskGIT(Trainer):
                     E_old[b] = self.energy_norm(
                         code[b:b+1],
                         labels[b:b+1],
-                        positions=idx[b],
                     )[0]
                     E_new[b] = self.energy_norm(
                         cand[b:b+1],
                         labels[b:b+1],
-                        positions=idx[b],
                     )[0]
 
                 log_alpha = -(E_new - E_old) + (log_q_rev - log_q_fwd)
