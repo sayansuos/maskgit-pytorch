@@ -763,7 +763,12 @@ class MaskGIT(Trainer):
                 max(0, steps - 2),
                 max(0, steps - 1),
             ]
-
+            E_current = torch.zeros(nb_sample, device=self.args.device)
+            for b in range(nb_sample):
+                E_current[b] = self.energy_norm(
+                    code[b:b+1],
+                    labels[b:b+1],
+                )[0]
             for s in range(steps):
                 code_flat = code.view(nb_sample, total_tokens)
 
@@ -812,14 +817,10 @@ class MaskGIT(Trainer):
                 cand = cand_flat.view(nb_sample, self.patch_size, self.patch_size)
 
                 # on attribue les énergies
-                E_old = torch.zeros(nb_sample, device=self.args.device)
+                E_old = E_current.clone()
                 E_new = torch.zeros(nb_sample, device=self.args.device)
 
                 for b in range(nb_sample):
-                    E_old[b] = self.energy_norm(
-                        code[b:b+1],
-                        labels[b:b+1],
-                    )[0]
                     E_new[b] = self.energy_norm(
                         cand[b:b+1],
                         labels[b:b+1],
@@ -832,6 +833,7 @@ class MaskGIT(Trainer):
 
                 code_flat[accept] = cand_flat[accept]
                 code = code_flat.view(nb_sample, self.patch_size, self.patch_size)
+                E_current[accept] = E_new[accept]
 
                 if s in save_steps:
                     l_codes.append(code.detach().cpu().clone())
