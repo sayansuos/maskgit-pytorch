@@ -697,6 +697,7 @@ class MaskGIT(Trainer):
     w=0.0,
     steps=200,
     jump_size=4,
+    energy="norm"
 ):
         """Generate sample with the MaskGIT model using Metropolis-Hastings
         :param
@@ -737,17 +738,7 @@ class MaskGIT(Trainer):
                 )
 
                 # warm start
-                with torch.cuda.amp.autocast():
-                    if w != 0:
-                        logits = self.vit(
-                            torch.cat([code, code], dim=0),
-                            torch.cat([labels, labels], dim=0),
-                            torch.cat([~drop, drop], dim=0),
-                        )
-                        logits_c, logits_u = torch.chunk(logits, 2, dim=0)
-                        logits = (1 + w) * logits_c - w * logits_u
-                    else:
-                        logits = self.vit(code, labels, drop_label=~drop)
+                logits = self.guided_logits(code, labels, drop, w=w)
 
                 pred = torch.distributions.Categorical(logits=logits * sm_temp).sample()
                 code = pred.view(nb_sample, self.patch_size, self.patch_size)
@@ -763,13 +754,10 @@ class MaskGIT(Trainer):
                 max(0, steps - 2),
                 max(0, steps - 1),
             ]
-            E_current = torch.zeros(nb_sample, device=self.args.device)
-            for b in range(nb_sample):
-                E_current[b] = self.energy_norm(
-                    code[b:b+1],
-                    labels[b:b+1],
-                )[0]
+            E_current = self.compute_energy(code, labels, energy=energy, w=w)
             for s in range(steps):
+                print(s)
+                print(E_current)
                 code_flat = code.view(nb_sample, total_tokens)
 
                 # positions aléatoires à modifier
@@ -783,17 +771,7 @@ class MaskGIT(Trainer):
                     masked_block[b, idx[b]] = self.args.mask_value
                 masked_block = masked_block.view(nb_sample, self.patch_size, self.patch_size)
 
-                with torch.cuda.amp.autocast():
-                    if w != 0:
-                        logits = self.vit(
-                            torch.cat([masked_block, masked_block], dim=0),
-                            torch.cat([labels, labels], dim=0),
-                            torch.cat([~drop, drop], dim=0),
-                        )
-                        logits_c, logits_u = torch.chunk(logits, 2, dim=0)
-                        logits = (1 + w) * logits_c - w * logits_u
-                    else:
-                        logits = self.vit(masked_block, labels, drop_label=~drop)
+                logits = self.guided_logits(masked_block, labels, drop, w=w)
 
                 logp = F.log_softmax(logits * sm_temp, dim=-1)
 
@@ -818,19 +796,13 @@ class MaskGIT(Trainer):
 
                 # on attribue les énergies
                 E_old = E_current.clone()
-                E_new = torch.zeros(nb_sample, device=self.args.device)
-
-                for b in range(nb_sample):
-                    E_new[b] = self.energy_norm(
-                        cand[b:b+1],
-                        labels[b:b+1],
-                    )[0]
+                E_new = self.compute_energy(cand, labels, energy=energy, w=w)
 
                 log_alpha = -(E_new - E_old) + (log_q_rev - log_q_fwd)
                 accept = torch.rand(nb_sample, device=self.args.device) < torch.exp(
                     torch.clamp(log_alpha, max=0.0)
                 )
-
+                print(torch.exp(torch.clamp(log_alpha, max=0.0)))
                 code_flat[accept] = cand_flat[accept]
                 code = code_flat.view(nb_sample, self.patch_size, self.patch_size)
                 E_current[accept] = E_new[accept]
@@ -853,7 +825,7 @@ class MaskGIT(Trainer):
         self.vit.train()
         return x, l_codes, l_mask
 
-    def energy_norm(self, code, labels, positions=None):
+    def energy_norm(self, code, labels, positions=None, w=0.0):
         device = code.device
         #batch size et longeur de la séquence
         B = code.size(0)
@@ -873,8 +845,7 @@ class MaskGIT(Trainer):
             masked = masked.view(B, self.patch_size, self.patch_size)
 
             #on calcule les logits des tokens
-            with torch.cuda.amp.autocast():
-                    logits = self.vit(masked, labels, drop_label=~drop)
+            logits = self.guided_logits(masked, labels, drop, w=w)
             #on obtient les log probas
             logp = F.log_softmax(logits[:, i, :], dim=-1)
             #on prend le ie token
@@ -883,3 +854,57 @@ class MaskGIT(Trainer):
             E -= logp.gather(1, tok[:, None]).squeeze(1)
 
         return E
+
+    def energy_raw(self, code, labels, positions=None, w=0.0):
+        device = code.device
+        B = code.size(0)
+        T = self.patch_size * self.patch_size
+
+        flat_code = code.view(B, T)
+
+        if positions is None:
+            positions = torch.arange(T, device=device)
+        elif not torch.is_tensor(positions):
+            positions = torch.tensor(positions, device=device, dtype=torch.long)
+
+        drop = torch.ones(B, dtype=torch.bool, device=device)
+        E = torch.zeros(B, device=device, dtype=torch.float32)
+
+        for i in positions.tolist():
+            masked = flat_code.clone()
+            masked[:, i] = self.args.mask_value
+            masked = masked.view(B, self.patch_size, self.patch_size)
+
+            logits = self.guided_logits(masked, labels, drop, w=w)
+
+            score_i = logits[:, i, :]
+
+            tok_i = flat_code[:, i]
+
+            true_score = score_i.gather(1, tok_i[:, None]).squeeze(1).float()
+
+            E -= true_score
+
+        return E
+    
+    def compute_energy(self, code, labels, energy="norm", w=0.0):
+        if energy == "norm":
+            return self.energy_norm(code, labels, w=w)
+        elif energy == "raw":
+            return self.energy_raw(code, labels, w=w)
+        else:
+            raise ValueError("Unknown energy type")
+        
+    def guided_logits(self, code, labels, drop, w=0.0):
+        with torch.cuda.amp.autocast():
+            if w != 0:
+                logits = self.vit(
+                    torch.cat([code, code], dim=0),
+                    torch.cat([labels, labels], dim=0),
+                    torch.cat([~drop, drop], dim=0),
+                )
+                logits_c, logits_u = torch.chunk(logits, 2, dim=0)
+                logits = (1 + w) * logits_c - w * logits_u
+            else:
+                logits = self.vit(code, labels, drop_label=~drop)
+        return logits
